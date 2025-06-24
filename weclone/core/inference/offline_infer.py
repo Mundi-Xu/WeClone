@@ -1,38 +1,22 @@
-# Copyright 2025 the LlamaFactory team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+from typing import List, Optional, cast
 
-import json
-from typing import List, Optional, Union
-
-
-from llamafactory.data import get_dataset, get_template_and_fix_tokenizer
-from llamafactory.extras.constants import IGNORE_INDEX
+from llamafactory.data import get_template_and_fix_tokenizer
 from llamafactory.extras.misc import get_device_count
-from llamafactory.extras.packages import is_vllm_available
 from llamafactory.hparams import get_infer_args
 from llamafactory.model import load_tokenizer
 from pydantic import BaseModel
+from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
 from vllm.sampling_params import GuidedDecodingParams
 
+from weclone.utils.config import load_config
+from weclone.utils.config_models import VllmArgs
 
-if is_vllm_available():
-    from vllm import LLM, SamplingParams
-    from vllm.lora.request import LoRARequest
+# 这里不需要写太好，transforms库后续更新自带vllm
 
 
-def infer(
-    inputs: Union[str, List[str]],
+def vllm_infer(
+    inputs: List[str],
     model_name_or_path: str,
     adapter_name_or_path: Optional[str] = None,
     dataset: str = "alpaca_en_demo",
@@ -42,6 +26,8 @@ def infer(
     max_samples: Optional[int] = None,
     vllm_config: str = "{}",
     save_name: str = "generated_predictions.jsonl",
+    default_system: Optional[str] = None,
+    enable_thinking: bool = False,
     temperature: float = 0.95,
     top_p: float = 0.7,
     top_k: int = 50,
@@ -60,23 +46,25 @@ def infer(
     if pipeline_parallel_size > get_device_count():
         raise ValueError("Pipeline parallel size should be smaller than the number of gpus.")
 
+    wc_vllm_args = cast(VllmArgs, load_config("vllm"))
     model_args, data_args, _, generating_args = get_infer_args(
-        dict(
-            model_name_or_path=model_name_or_path,
-            adapter_name_or_path=adapter_name_or_path,
-            dataset=dataset,
-            dataset_dir=dataset_dir,
-            template=template,
-            cutoff_len=cutoff_len,
-            max_samples=max_samples,
-            preprocessing_num_workers=16,
-            vllm_config=vllm_config,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            max_new_tokens=max_new_tokens,
-            repetition_penalty=repetition_penalty,
-        )
+        {
+            "model_name_or_path": model_name_or_path,
+            "adapter_name_or_path": adapter_name_or_path,
+            "dataset": dataset,
+            "dataset_dir": dataset_dir,
+            "template": template,
+            "cutoff_len": cutoff_len,
+            "max_samples": max_samples,
+            "preprocessing_num_workers": 16,
+            "vllm_config": vllm_config,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "max_new_tokens": max_new_tokens,
+            "repetition_penalty": repetition_penalty,
+            "enable_thinking": enable_thinking,
+        }
     )
 
     tokenizer_module = load_tokenizer(model_args)
@@ -118,6 +106,9 @@ def infer(
         "disable_log_stats": True,
         "enable_lora": model_args.adapter_name_or_path is not None,
         "enable_prefix_caching": True,  # 是否启用前缀缓存
+        "gpu_memory_utilization": wc_vllm_args.gpu_memory_utilization,
+        # "quantization": "bitsandbytes", # 是否启用vllm的 bitsandbytes 的量化加载
+        # "load_format": "bitsandbytes",
     }
     if template_obj.mm_plugin.__class__.__name__ != "BasePlugin":
         engine_args["limit_mm_per_prompt"] = {"image": 4, "video": 2, "audio": 2}
@@ -125,13 +116,10 @@ def infer(
     if isinstance(model_args.vllm_config, dict):
         engine_args.update(model_args.vllm_config)
 
-    results = LLM(**engine_args).generate(inputs, sampling_params, lora_request=lora_request)
-    return results
-    # preds = [result.outputs[0].text for result in results]
-    # with open(save_name, "w", encoding="utf-8") as f:
-    #     for text, pred, label in zip(prompts, preds, labels):
-    #         f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
+    messages_list = [[{"role": "user", "content": text}] for text in inputs]
+    extra_body = {"guided_json": json_schema, "enable_thinking": False}
 
-    # print("*" * 70)
-    # print(f"{len(prompts)} generated results have been saved at {save_name}.")
-    # print("*" * 70)
+    results = LLM(**engine_args).chat(
+        messages_list, sampling_params, lora_request=lora_request, chat_template_kwargs=extra_body
+    )  # type: ignore
+    return results
